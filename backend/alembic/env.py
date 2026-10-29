@@ -10,8 +10,24 @@ from alembic import context
 from app.core.config import settings
 from app.database.connection import Base
 
+
+# ---------------------------------------------------------
 # Import all models that Alembic needs to detect.
-# Keep this import even if User is not directly referenced below.
+# ---------------------------------------------------------
+#
+# These imports ensure that all SQLAlchemy models are
+# registered in Base.metadata before Alembic compares
+# the models with the database.
+#
+# TargetAudience is included because it is now the
+# common foreign-key table for:
+#
+#   Training
+#   HOD
+#   LineManager
+#
+# ---------------------------------------------------------
+
 from app.models import (
     User,
     Department,
@@ -24,7 +40,9 @@ from app.models import (
     ReminderRecipient,
     Reminder,
     TrainingDocument,
+    TargetAudience,
 )
+
 
 # ---------------------------------------------------------
 # Alembic Config
@@ -36,15 +54,13 @@ config = context.config
 # ---------------------------------------------------------
 # Database URL
 # ---------------------------------------------------------
+#
 # Alembic uses ConfigParser internally.
 # ConfigParser treats "%" as interpolation syntax.
 #
-# Example:
-# postgres password encoded as @
-# %40
+# Therefore "%" must be escaped as "%%" before passing
+# the URL to Alembic.
 #
-# Therefore we escape "%" as "%%" before giving the URL
-# to Alembic.
 # ---------------------------------------------------------
 
 database_url = settings.DATABASE_URL.replace("%", "%%")
@@ -66,8 +82,13 @@ if config.config_file_name is not None:
 # ---------------------------------------------------------
 # SQLAlchemy Metadata
 # ---------------------------------------------------------
+#
 # Alembic compares this metadata with the actual database
-# and automatically generates migrations.
+# schema when generating migrations.
+#
+# Because TargetAudience is imported above, its table will
+# also be included in Base.metadata.
+#
 # ---------------------------------------------------------
 
 target_metadata = Base.metadata
@@ -82,7 +103,9 @@ def run_migrations_offline() -> None:
     Run migrations without creating a database connection.
     """
 
-    url = config.get_main_option("sqlalchemy.url")
+    url = config.get_main_option(
+        "sqlalchemy.url"
+    )
 
     context.configure(
         url=url,
@@ -101,7 +124,9 @@ def run_migrations_offline() -> None:
 # ONLINE MIGRATIONS
 # ---------------------------------------------------------
 
-def do_run_migrations(connection: Connection) -> None:
+def do_run_migrations(
+    connection: Connection
+) -> None:
     """
     Configure Alembic using an active database connection.
     """
@@ -114,6 +139,10 @@ def do_run_migrations(connection: Connection) -> None:
     with context.begin_transaction():
         context.run_migrations()
 
+
+# ---------------------------------------------------------
+# ASYNC MIGRATIONS
+# ---------------------------------------------------------
 
 async def run_async_migrations() -> None:
     """

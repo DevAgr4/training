@@ -10,3 +10,5 @@ from app.models.reminder_recipient import ReminderRecipient
 from app.models.reminder import Reminder
 from app.models.training_document import TrainingDocument
 from app.models.excel_import import ExcelImport
+from app.models.whatsapp_template import WhatsAppTemplate
+from app.models.target_audience import TargetAudience

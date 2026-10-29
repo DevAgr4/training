@@ -1,366 +1,1398 @@
 from io import BytesIO
+from datetime import datetime, date, time, timedelta
+import re
 
+import httpx
 import pandas as pd
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from sqlalchemy import select
+
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    UploadFile,
+)
+
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.connection import get_db
-from app.models.department import Department
-from app.models.employee import Employee
-from app.models.hod import HOD
-from app.models.line_manager import LineManager
+from app.models.target_audience import TargetAudience
 from app.models.training import Training
-from app.models.training_assignment import TrainingAssignment
 
+
+# ============================================================
+# ROUTER
+# ============================================================
 
 router = APIRouter(
     prefix="/api/excel",
-    tags=["Excel Import"]
+    tags=["Excel Import"],
 )
 
 
-# --------------------------------------------------
-# Required Excel columns
-# --------------------------------------------------
+# ============================================================
+# TRAINING CALENDAR FORMAT
+# ============================================================
 
 REQUIRED_COLUMNS = [
-    "Employee",
-    "Employee Email",
-    "Training",
-    "Training Date",
-    "Department",
-    "HOD",
-    "HOD Email",
-    "Line Manager",
-    "Manager Email",
+    "S.No",
+    "Training From Date",
+    "Training To Date",
+    "Day",
+    "Training Topic",
+    "Training Type",
+    "Target Audience",
+    "Trainer's Name",
+    "Timing",
+    "Duration of the Training Hours",
+    "Venue",
 ]
 
 
-# ==================================================
-# HELPER FUNCTIONS
-# ==================================================
-
-async def get_or_create_department(
-    db: AsyncSession,
-    name: str,
-) -> Department:
-
-    result = await db.execute(
-        select(Department).where(
-            Department.name == name
-        )
-    )
-
-    department = result.scalar_one_or_none()
-
-    if department:
-        return department
-
-    department = Department(
-        name=name
-    )
-
-    db.add(department)
-
-    await db.flush()
-
-    return department
+# The calendar should contain ONLY these columns.
+ALLOWED_COLUMNS = REQUIRED_COLUMNS.copy()
 
 
-async def get_or_create_hod(
-    db: AsyncSession,
-    name: str,
-    email: str,
-    department_id: int,
-) -> HOD:
+# ============================================================
+# COLUMN ALIASES
+# ============================================================
 
-    result = await db.execute(
-        select(HOD).where(
-            HOD.email == email,
-            HOD.department_id == department_id,
-        )
-    )
+COLUMN_ALIASES = {
+    # Serial number
+    "S.No.": "S.No",
+    "S No": "S.No",
+    "S.No": "S.No",
+    "Serial No": "S.No",
+    "Serial Number": "S.No",
 
-    hod = result.scalar_one_or_none()
+    # Dates
+    "Training From Date": "Training From Date",
+    "From Date": "Training From Date",
+    "Training Start Date": "Training From Date",
+    "Start Date": "Training From Date",
 
-    if hod:
-        hod.name = name
-        return hod
+    "Training To Date": "Training To Date",
+    "To Date": "Training To Date",
+    "Training End Date": "Training To Date",
+    "End Date": "Training To Date",
 
-    hod = HOD(
-        name=name,
-        email=email,
-        department_id=department_id,
-    )
+    # Training
+    "Training Topic": "Training Topic",
+    "Training Name": "Training Topic",
+    "Training": "Training Topic",
 
-    db.add(hod)
+    "Training Type": "Training Type",
+    "Type": "Training Type",
 
-    await db.flush()
+    # Audience
+    "Target Audience": "Target Audience",
+    "Audience": "Target Audience",
 
-    return hod
+    # Trainer
+    "Trainer's Name": "Trainer's Name",
+    "Trainer Name": "Trainer's Name",
+    "Trainer": "Trainer's Name",
 
+    # Timing
+    "Timing": "Timing",
+    "Training Time": "Timing",
+    "Time": "Timing",
 
-async def get_or_create_line_manager(
-    db: AsyncSession,
-    name: str,
-    email: str,
-    department_id: int,
-) -> LineManager:
+    # Duration
+    "Duration of the Training Hours":
+        "Duration of the Training Hours",
+    "Duration":
+        "Duration of the Training Hours",
+    "Training Duration":
+        "Duration of the Training Hours",
 
-    result = await db.execute(
-        select(LineManager).where(
-            LineManager.email == email,
-            LineManager.department_id == department_id,
-        )
-    )
-
-    manager = result.scalar_one_or_none()
-
-    if manager:
-        manager.name = name
-        return manager
-
-    manager = LineManager(
-        name=name,
-        email=email,
-        department_id=department_id,
-    )
-
-    db.add(manager)
-
-    await db.flush()
-
-    return manager
+    # Venue
+    "Venue": "Venue",
+    "Training Venue": "Venue",
+    "Location": "Venue",
+}
 
 
-# ==================================================
-# EXCEL VALIDATION
-# ==================================================
+# ============================================================
+# GENERAL HELPERS
+# ============================================================
 
-def validate_dataframe(dataframe: pd.DataFrame):
+def clean_value(
+    value,
+    default=None,
+):
+    """
+    Clean values coming from Excel.
+    """
 
-    errors = []
+    if value is None:
+        return default
 
-    # --------------------------------------------------
-    # Clean column names
-    # --------------------------------------------------
+    try:
+        if pd.isna(value):
+            return default
+    except Exception:
+        pass
+
+    if isinstance(value, str):
+        value = value.strip()
+
+        if not value:
+            return default
+
+    return value
+
+
+def normalize_columns(
+    dataframe: pd.DataFrame,
+):
+    """
+    Normalize Excel headers using known aliases.
+    """
+
+    dataframe = dataframe.copy()
 
     dataframe.columns = [
         str(column).strip()
         for column in dataframe.columns
     ]
 
-    # --------------------------------------------------
-    # Check required columns
-    # --------------------------------------------------
+    rename_map = {}
 
-    missing_columns = [
-        column
-        for column in REQUIRED_COLUMNS
-        if column not in dataframe.columns
+    for column in dataframe.columns:
+
+        normalized = COLUMN_ALIASES.get(
+            column
+        )
+
+        if (
+            normalized
+            and normalized != column
+            and normalized not in dataframe.columns
+        ):
+            rename_map[column] = normalized
+
+    if rename_map:
+        dataframe = dataframe.rename(
+            columns=rename_map
+        )
+
+    return dataframe
+
+
+# ============================================================
+# DATE PARSER
+# ============================================================
+
+def parse_excel_date(value):
+    """
+    Convert Excel date values into Python date.
+    """
+
+    if value is None:
+        return None
+
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+
+    if isinstance(value, datetime):
+        return value.date()
+
+    if isinstance(value, date):
+        return value
+
+    parsed = pd.to_datetime(
+        value,
+        errors="coerce",
+    )
+
+    if pd.isna(parsed):
+        return None
+
+    return parsed.date()
+
+
+# ============================================================
+# TIME PARSER
+# ============================================================
+
+def parse_training_time(
+    value,
+):
+    """
+    Parse the beginning of the training time.
+
+    Supported examples:
+
+        09:00 AM
+        09:00
+        9 AM
+        09:00 AM - 01:00 PM
+        09:00-13:00
+        09:00 AM to 01:00 PM
+    """
+
+    if value is None:
+        return None
+
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+
+    if isinstance(value, datetime):
+        return value.time()
+
+    if isinstance(value, time):
+        return value
+
+    # Excel time-like object
+    if hasattr(value, "hour") and hasattr(
+        value,
+        "minute",
+    ):
+        try:
+            return time(
+                int(value.hour),
+                int(value.minute),
+                int(
+                    getattr(
+                        value,
+                        "second",
+                        0,
+                    )
+                ),
+            )
+        except Exception:
+            pass
+
+    text = str(value).strip()
+
+    if not text:
+        return None
+
+    # Normalize separators.
+    text = re.sub(
+        r"\s+to\s+",
+        " - ",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # Take the starting time from a range.
+    if " - " in text:
+
+        text = text.split(
+            " - ",
+            1,
+        )[0].strip()
+
+    elif "-" in text:
+
+        parts = text.split(
+            "-",
+            1,
+        )
+
+        if len(parts) == 2:
+            text = parts[0].strip()
+
+    formats = [
+        "%I:%M %p",
+        "%I:%M%p",
+        "%I %p",
+        "%H:%M",
+        "%H:%M:%S",
     ]
 
-    if missing_columns:
-        return {
-            "valid": False,
-            "missing_columns": missing_columns,
-            "errors": [],
-        }
+    for fmt in formats:
 
-    # --------------------------------------------------
-    # Remove empty rows
-    # --------------------------------------------------
+        try:
+            return datetime.strptime(
+                text,
+                fmt,
+            ).time()
+
+        except ValueError:
+            continue
+
+    parsed = pd.to_datetime(
+        text,
+        errors="coerce",
+    )
+
+    if pd.isna(parsed):
+        return None
+
+    return parsed.time()
+
+
+# ============================================================
+# DURATION PARSER
+# ============================================================
+
+def parse_duration(
+    value,
+):
+    """
+    Parse duration in hours.
+
+    Examples:
+
+        2
+        2.5
+        "2"
+        "2.5 hours"
+        "4 Hours"
+    """
+
+    value = clean_value(
+        value
+    )
+
+    if value is None:
+        return None
+
+    if isinstance(
+        value,
+        (int, float),
+    ):
+
+        if float(value) < 0:
+            return None
+
+        return float(value)
+
+    text = str(value).strip()
+
+    match = re.search(
+        r"\d+(?:\.\d+)?",
+        text,
+    )
+
+    if not match:
+        return None
+
+    try:
+
+        duration = float(
+            match.group()
+        )
+
+        if duration < 0:
+            return None
+
+        return duration
+
+    except ValueError:
+        return None
+
+
+# ============================================================
+# DAY VALIDATION
+# ============================================================
+
+VALID_DAYS = {
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+}
+
+
+def validate_day(
+    value,
+    training_date,
+):
+    """
+    Validate the Day column against
+    Training From Date.
+
+    Empty Day is considered invalid because
+    Day is part of the required calendar format.
+    """
+
+    value = clean_value(
+        value
+    )
+
+    if value is None:
+        return False
+
+    if training_date is None:
+        return False
+
+    day = str(
+        value
+    ).strip().lower()
+
+    if day not in VALID_DAYS:
+        return False
+
+    expected_day = (
+        training_date
+        .strftime("%A")
+        .lower()
+    )
+
+    return day == expected_day
+
+
+# ============================================================
+# SERIAL NUMBER VALIDATION
+# ============================================================
+
+def parse_serial_number(
+    value,
+):
+    """
+    Parse S.No.
+    """
+
+    value = clean_value(
+        value
+    )
+
+    if value is None:
+        return None
+
+    try:
+
+        number = int(
+            float(value)
+        )
+
+        if number <= 0:
+            return None
+
+        return number
+
+    except (
+        ValueError,
+        TypeError,
+    ):
+        return None
+
+
+# ============================================================
+# DATAFRAME VALIDATION
+# ============================================================
+
+def validate_dataframe(
+    dataframe: pd.DataFrame,
+):
+    """
+    Validate the complete training calendar.
+    """
+
+    errors = []
+
+    # --------------------------------------------------------
+    # Normalize headers
+    # --------------------------------------------------------
+
+    dataframe = normalize_columns(
+        dataframe
+    )
+
+    # --------------------------------------------------------
+    # Remove completely empty rows
+    # --------------------------------------------------------
 
     dataframe = dataframe.dropna(
         how="all"
     ).copy()
 
-    # --------------------------------------------------
-    # Employee validation
-    # --------------------------------------------------
+    if dataframe.empty:
 
-    if dataframe["Employee"].isna().any():
+        return {
+            "valid": False,
+            "missing_columns": [],
+            "extra_columns": [],
+            "available_columns": [],
+            "errors": [
+                {
+                    "field": "Excel File",
+                    "rows": [],
+                    "message": (
+                        "The Excel file does not "
+                        "contain any training rows."
+                    ),
+                }
+            ],
+            "dataframe": dataframe,
+        }
 
-        rows = dataframe.index[
-            dataframe["Employee"].isna()
-        ].tolist()
+    # --------------------------------------------------------
+    # Detect missing columns
+    # --------------------------------------------------------
 
-        errors.append({
-            "field": "Employee",
-            "rows": [row + 2 for row in rows],
-            "message": "Employee name is missing.",
-        })
-
-    # --------------------------------------------------
-    # Training validation
-    # --------------------------------------------------
-
-    if dataframe["Training"].isna().any():
-
-        rows = dataframe.index[
-            dataframe["Training"].isna()
-        ].tolist()
-
-        errors.append({
-            "field": "Training",
-            "rows": [row + 2 for row in rows],
-            "message": "Training name is missing.",
-        })
-
-    # --------------------------------------------------
-    # Department validation
-    # --------------------------------------------------
-
-    if dataframe["Department"].isna().any():
-
-        rows = dataframe.index[
-            dataframe["Department"].isna()
-        ].tolist()
-
-        errors.append({
-            "field": "Department",
-            "rows": [row + 2 for row in rows],
-            "message": "Department is missing.",
-        })
-
-    # --------------------------------------------------
-    # HOD validation
-    # --------------------------------------------------
-
-    if dataframe["HOD"].isna().any():
-
-        rows = dataframe.index[
-            dataframe["HOD"].isna()
-        ].tolist()
-
-        errors.append({
-            "field": "HOD",
-            "rows": [row + 2 for row in rows],
-            "message": "HOD name is missing.",
-        })
-
-    # --------------------------------------------------
-    # HOD email validation
-    # --------------------------------------------------
-
-    if dataframe["HOD Email"].isna().any():
-
-        rows = dataframe.index[
-            dataframe["HOD Email"].isna()
-        ].tolist()
-
-        errors.append({
-            "field": "HOD Email",
-            "rows": [row + 2 for row in rows],
-            "message": "HOD email is missing.",
-        })
-
-    # --------------------------------------------------
-    # Line Manager validation
-    # --------------------------------------------------
-
-    if dataframe["Line Manager"].isna().any():
-
-        rows = dataframe.index[
-            dataframe["Line Manager"].isna()
-        ].tolist()
-
-        errors.append({
-            "field": "Line Manager",
-            "rows": [row + 2 for row in rows],
-            "message": "Line Manager name is missing.",
-        })
-
-    # --------------------------------------------------
-    # Training date validation
-    # --------------------------------------------------
-
-    parsed_dates = pd.to_datetime(
-        dataframe["Training Date"],
-        errors="coerce"
+    actual_columns = list(
+        dataframe.columns
     )
 
-    invalid_dates = parsed_dates.isna()
+    missing_columns = [
+        column
+        for column in REQUIRED_COLUMNS
+        if column not in actual_columns
+    ]
 
-    if invalid_dates.any():
+    # --------------------------------------------------------
+    # Detect extra columns
+    # --------------------------------------------------------
 
-        rows = dataframe.index[
-            invalid_dates
-        ].tolist()
+    extra_columns = [
+        column
+        for column in actual_columns
+        if column not in ALLOWED_COLUMNS
+    ]
 
-        errors.append({
-            "field": "Training Date",
-            "rows": [row + 2 for row in rows],
-            "message": "Training date is invalid or missing.",
-        })
+    if missing_columns:
 
-    # --------------------------------------------------
-    # Duplicate validation
-    # --------------------------------------------------
+        return {
+            "valid": False,
+            "missing_columns": missing_columns,
+            "extra_columns": extra_columns,
+            "available_columns": actual_columns,
+            "errors": [],
+            "dataframe": dataframe,
+        }
 
-    duplicates = dataframe.duplicated(
+    # --------------------------------------------------------
+    # Extra columns
+    # --------------------------------------------------------
+
+    if extra_columns:
+
+        return {
+            "valid": False,
+            "missing_columns": [],
+            "extra_columns": extra_columns,
+            "available_columns": actual_columns,
+            "errors": [
+                {
+                    "field": "Extra Columns",
+                    "rows": [],
+                    "message": (
+                        "The training calendar must "
+                        "contain only the 11 approved "
+                        "columns."
+                    ),
+                }
+            ],
+            "dataframe": dataframe,
+        }
+
+    # ========================================================
+    # ROW VALIDATION
+    # ========================================================
+
+    serial_numbers = set()
+
+    from_dates = {}
+    to_dates = {}
+
+    # --------------------------------------------------------
+    # S.No
+    # --------------------------------------------------------
+
+    invalid_serial_rows = []
+    duplicate_serial_rows = []
+
+    for index, value in dataframe[
+        "S.No"
+    ].items():
+
+        serial = parse_serial_number(
+            value
+        )
+
+        if serial is None:
+
+            invalid_serial_rows.append(
+                index
+            )
+
+        else:
+
+            if serial in serial_numbers:
+                duplicate_serial_rows.append(
+                    index
+                )
+
+            serial_numbers.add(
+                serial
+            )
+
+    if invalid_serial_rows:
+
+        errors.append(
+            {
+                "field": "S.No",
+                "rows": [
+                    index + 2
+                    for index in invalid_serial_rows
+                ],
+                "message": (
+                    "S.No must contain a "
+                    "positive number."
+                ),
+            }
+        )
+
+    if duplicate_serial_rows:
+
+        errors.append(
+            {
+                "field": "S.No",
+                "rows": [
+                    index + 2
+                    for index in duplicate_serial_rows
+                ],
+                "message": (
+                    "Duplicate S.No found."
+                ),
+            }
+        )
+
+    # --------------------------------------------------------
+    # Training From Date
+    # --------------------------------------------------------
+
+    invalid_rows = []
+
+    for index, value in dataframe[
+        "Training From Date"
+    ].items():
+
+        parsed = parse_excel_date(
+            value
+        )
+
+        if parsed is None:
+
+            invalid_rows.append(
+                index
+            )
+
+        else:
+
+            from_dates[index] = parsed
+
+    if invalid_rows:
+
+        errors.append(
+            {
+                "field": "Training From Date",
+                "rows": [
+                    index + 2
+                    for index in invalid_rows
+                ],
+                "message": (
+                    "Training From Date is "
+                    "missing or invalid."
+                ),
+            }
+        )
+
+    # --------------------------------------------------------
+    # Training To Date
+    # --------------------------------------------------------
+
+    invalid_rows = []
+
+    for index, value in dataframe[
+        "Training To Date"
+    ].items():
+
+        parsed = parse_excel_date(
+            value
+        )
+
+        if parsed is None:
+
+            invalid_rows.append(
+                index
+            )
+
+        else:
+
+            to_dates[index] = parsed
+
+    if invalid_rows:
+
+        errors.append(
+            {
+                "field": "Training To Date",
+                "rows": [
+                    index + 2
+                    for index in invalid_rows
+                ],
+                "message": (
+                    "Training To Date is "
+                    "missing or invalid."
+                ),
+            }
+        )
+
+    # --------------------------------------------------------
+    # Date range
+    # --------------------------------------------------------
+
+    invalid_range_rows = []
+
+    for index in dataframe.index:
+
+        from_date = from_dates.get(
+            index
+        )
+
+        to_date = to_dates.get(
+            index
+        )
+
+        if (
+            from_date
+            and to_date
+            and to_date < from_date
+        ):
+
+            invalid_range_rows.append(
+                index
+            )
+
+    if invalid_range_rows:
+
+        errors.append(
+            {
+                "field": "Training Date Range",
+                "rows": [
+                    index + 2
+                    for index in invalid_range_rows
+                ],
+                "message": (
+                    "Training To Date cannot "
+                    "be before Training From Date."
+                ),
+            }
+        )
+
+    # --------------------------------------------------------
+    # Day
+    # --------------------------------------------------------
+
+    invalid_rows = []
+
+    for index, value in dataframe[
+        "Day"
+    ].items():
+
+        if not validate_day(
+            value,
+            from_dates.get(index),
+        ):
+
+            invalid_rows.append(
+                index
+            )
+
+    if invalid_rows:
+
+        errors.append(
+            {
+                "field": "Day",
+                "rows": [
+                    index + 2
+                    for index in invalid_rows
+                ],
+                "message": (
+                    "Day must match the "
+                    "Training From Date."
+                ),
+            }
+        )
+
+    # --------------------------------------------------------
+    # Training Topic
+    # --------------------------------------------------------
+
+    invalid_rows = []
+
+    for index, value in dataframe[
+        "Training Topic"
+    ].items():
+
+        if clean_value(
+            value
+        ) is None:
+
+            invalid_rows.append(
+                index
+            )
+
+    if invalid_rows:
+
+        errors.append(
+            {
+                "field": "Training Topic",
+                "rows": [
+                    index + 2
+                    for index in invalid_rows
+                ],
+                "message": (
+                    "Training Topic is required."
+                ),
+            }
+        )
+
+    # --------------------------------------------------------
+    # Training Type
+    # --------------------------------------------------------
+
+    invalid_rows = []
+
+    for index, value in dataframe[
+        "Training Type"
+    ].items():
+
+        if clean_value(
+            value
+        ) is None:
+
+            invalid_rows.append(
+                index
+            )
+
+    if invalid_rows:
+
+        errors.append(
+            {
+                "field": "Training Type",
+                "rows": [
+                    index + 2
+                    for index in invalid_rows
+                ],
+                "message": (
+                    "Training Type is required."
+                ),
+            }
+        )
+
+    # --------------------------------------------------------
+    # Target Audience
+    # --------------------------------------------------------
+
+    invalid_rows = []
+
+    for index, value in dataframe[
+        "Target Audience"
+    ].items():
+
+        if clean_value(
+            value
+        ) is None:
+
+            invalid_rows.append(
+                index
+            )
+
+    if invalid_rows:
+
+        errors.append(
+            {
+                "field": "Target Audience",
+                "rows": [
+                    index + 2
+                    for index in invalid_rows
+                ],
+                "message": (
+                    "Target Audience is required."
+                ),
+            }
+        )
+
+    # --------------------------------------------------------
+    # Trainer
+    # --------------------------------------------------------
+
+    invalid_rows = []
+
+    for index, value in dataframe[
+        "Trainer's Name"
+    ].items():
+
+        if clean_value(
+            value
+        ) is None:
+
+            invalid_rows.append(
+                index
+            )
+
+    if invalid_rows:
+
+        errors.append(
+            {
+                "field": "Trainer's Name",
+                "rows": [
+                    index + 2
+                    for index in invalid_rows
+                ],
+                "message": (
+                    "Trainer's Name is required."
+                ),
+            }
+        )
+
+    # --------------------------------------------------------
+    # Timing
+    # --------------------------------------------------------
+
+    invalid_rows = []
+
+    for index, value in dataframe[
+        "Timing"
+    ].items():
+
+        if parse_training_time(
+            value
+        ) is None:
+
+            invalid_rows.append(
+                index
+            )
+
+    if invalid_rows:
+
+        errors.append(
+            {
+                "field": "Timing",
+                "rows": [
+                    index + 2
+                    for index in invalid_rows
+                ],
+                "message": (
+                    "Timing is invalid. "
+                    "Example: 09:00 AM - 01:00 PM."
+                ),
+            }
+        )
+
+    # --------------------------------------------------------
+    # Duration
+    # --------------------------------------------------------
+
+    invalid_rows = []
+
+    for index, value in dataframe[
+        "Duration of the Training Hours"
+    ].items():
+
+        duration = parse_duration(
+            value
+        )
+
+        if duration is None:
+
+            invalid_rows.append(
+                index
+            )
+
+    if invalid_rows:
+
+        errors.append(
+            {
+                "field": (
+                    "Duration of the Training Hours"
+                ),
+                "rows": [
+                    index + 2
+                    for index in invalid_rows
+                ],
+                "message": (
+                    "Duration must be a "
+                    "valid number of hours."
+                ),
+            }
+        )
+
+    # --------------------------------------------------------
+    # Venue
+    # --------------------------------------------------------
+
+    invalid_rows = []
+
+    for index, value in dataframe[
+        "Venue"
+    ].items():
+
+        if clean_value(
+            value
+        ) is None:
+
+            invalid_rows.append(
+                index
+            )
+
+    if invalid_rows:
+
+        errors.append(
+            {
+                "field": "Venue",
+                "rows": [
+                    index + 2
+                    for index in invalid_rows
+                ],
+                "message": (
+                    "Venue is required."
+                ),
+            }
+        )
+
+    # ========================================================
+    # DUPLICATE TRAINING SCHEDULES
+    # ========================================================
+
+    duplicate_mask = dataframe.duplicated(
         subset=[
-            "Employee",
-            "Training",
-            "Training Date",
+            "Training From Date",
+            "Training To Date",
+            "Training Topic",
+            "Target Audience",
+            "Trainer's Name",
         ],
         keep=False,
     )
 
-    duplicate_rows = dataframe.index[
-        duplicates
+    duplicate_indices = dataframe.index[
+        duplicate_mask
     ].tolist()
 
-    if duplicate_rows:
+    if duplicate_indices:
 
-        errors.append({
-            "field": "Duplicate Training",
-            "rows": [row + 2 for row in duplicate_rows],
-            "message": (
-                "Duplicate employee/training/date "
-                "combination found."
-            ),
-        })
+        errors.append(
+            {
+                "field": "Duplicate Training",
+                "rows": [
+                    index + 2
+                    for index in duplicate_indices
+                ],
+                "message": (
+                    "Duplicate training schedule "
+                    "found for the same date, topic, "
+                    "audience and trainer."
+                ),
+            }
+        )
+
+    # ========================================================
+    # RESULT
+    # ========================================================
 
     return {
         "valid": len(errors) == 0,
         "missing_columns": [],
+        "extra_columns": [],
+        "available_columns": actual_columns,
         "errors": errors,
         "dataframe": dataframe,
     }
 
 
-# ==================================================
-# 1. UPLOAD + PREVIEW
-# ==================================================
+# ============================================================
+# RESOLVE TARGET AUDIENCE
+# ============================================================
+
+async def resolve_target_audience(
+    db: AsyncSession,
+    target_audience: str,
+):
+    """
+    Resolve Target Audience from the master table.
+
+    Target Audience records are maintained through the
+    Settings / Master Recipient Excel. The training calendar
+    must reference an existing Target Audience so that a typo
+    cannot silently create an audience with no recipients.
+    """
+
+    target_audience = str(target_audience).strip()
+
+    if not target_audience:
+        return None
+
+    result = await db.execute(
+        select(TargetAudience).where(
+            func.lower(TargetAudience.name)
+            == target_audience.lower()
+        )
+    )
+
+    return result.scalar_one_or_none()
+
+
+# ============================================================
+# REMINDER GENERATION
+# ============================================================
+
+async def generate_reminders_for_training(
+    training_id: int,
+):
+    """
+    Ask the reminder engine to generate
+    reminders for a training.
+
+    Recipient resolution is handled by
+    reminder_engine.py using training.audience_id.
+    """
+
+    url = (
+        "http://127.0.0.1:8000"
+        f"/api/reminder-engine/training/"
+        f"{training_id}/generate"
+    )
+
+    try:
+
+        async with httpx.AsyncClient(
+            timeout=30.0
+        ) as client:
+
+            response = await client.post(
+                url
+            )
+
+        # ----------------------------------------------------
+        # HTTP error
+        # ----------------------------------------------------
+
+        if response.status_code >= 400:
+
+            return {
+                "success": False,
+                "training_id": training_id,
+                "reminders_created": 0,
+                "error": (
+                    "Reminder engine returned "
+                    f"HTTP {response.status_code}: "
+                    f"{response.text}"
+                ),
+            }
+
+        # ----------------------------------------------------
+        # Parse JSON
+        # ----------------------------------------------------
+
+        try:
+
+            data = response.json()
+
+        except Exception:
+
+            return {
+                "success": False,
+                "training_id": training_id,
+                "reminders_created": 0,
+                "error": (
+                    "Reminder engine returned "
+                    "an invalid JSON response."
+                ),
+            }
+
+        return {
+            "success": bool(
+                data.get(
+                    "success",
+                    True,
+                )
+            ),
+            "training_id": training_id,
+            "reminders_created": int(
+                data.get(
+                    "reminders_created",
+                    0,
+                )
+            ),
+            "error": data.get(
+                "error"
+            ),
+        }
+
+    except Exception as error:
+
+        return {
+            "success": False,
+            "training_id": training_id,
+            "reminders_created": 0,
+            "error": str(error),
+        }
+
+
+# ============================================================
+# PREVIEW DATA
+# ============================================================
+
+def build_preview(
+    dataframe: pd.DataFrame,
+):
+    """
+    Build a frontend-friendly preview.
+    """
+
+    preview_dataframe = (
+        dataframe
+        .head(10)
+        .copy()
+    )
+
+    # --------------------------------------------------------
+    # Dates
+    # --------------------------------------------------------
+
+    preview_dataframe[
+        "Training From Date"
+    ] = preview_dataframe[
+        "Training From Date"
+    ].apply(
+        lambda value: (
+            parse_excel_date(
+                value
+            ).strftime(
+                "%Y-%m-%d"
+            )
+            if parse_excel_date(
+                value
+            )
+            else ""
+        )
+    )
+
+    preview_dataframe[
+        "Training To Date"
+    ] = preview_dataframe[
+        "Training To Date"
+    ].apply(
+        lambda value: (
+            parse_excel_date(
+                value
+            ).strftime(
+                "%Y-%m-%d"
+            )
+            if parse_excel_date(
+                value
+            )
+            else ""
+        )
+    )
+
+    # --------------------------------------------------------
+    # Timing
+    # --------------------------------------------------------
+
+    preview_dataframe[
+        "Timing"
+    ] = preview_dataframe[
+        "Timing"
+    ].apply(
+        lambda value: (
+            parse_training_time(
+                value
+            ).strftime(
+                "%H:%M"
+            )
+            if parse_training_time(
+                value
+            )
+            else ""
+        )
+    )
+
+    # --------------------------------------------------------
+    # Duration
+    # --------------------------------------------------------
+
+    preview_dataframe[
+        "Duration of the Training Hours"
+    ] = preview_dataframe[
+        "Duration of the Training Hours"
+    ].apply(
+        lambda value: (
+            parse_duration(
+                value
+            )
+            if parse_duration(
+                value
+            ) is not None
+            else ""
+        )
+    )
+
+    # --------------------------------------------------------
+    # Convert NaN
+    # --------------------------------------------------------
+
+    preview_dataframe = (
+        preview_dataframe
+        .fillna("")
+    )
+
+    return (
+        preview_dataframe
+        .to_dict(
+            orient="records"
+        )
+    )
+
+
+# ============================================================
+# UPLOAD / VALIDATE / PREVIEW
+# ============================================================
 
 @router.post("/upload")
 async def upload_excel(
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
 ):
     """
-    Upload and validate an Excel file.
+    Validate and preview a training calendar.
 
-    This endpoint does NOT save data to PostgreSQL.
-    It validates the spreadsheet and returns a preview.
+    IMPORTANT:
+        This endpoint does NOT write anything
+        to PostgreSQL.
     """
 
-    # --------------------------------------------------
-    # Check file name
-    # --------------------------------------------------
+    # --------------------------------------------------------
+    # Filename
+    # --------------------------------------------------------
 
     if not file.filename:
 
         raise HTTPException(
             status_code=400,
-            detail="No file was selected."
+            detail="No file was selected.",
         )
 
-    filename = file.filename.lower()
+    # --------------------------------------------------------
+    # Extension
+    # --------------------------------------------------------
+
+    filename = (
+        file.filename
+        .lower()
+    )
 
     if not filename.endswith(
-        (".xlsx", ".xls")
+        (
+            ".xlsx",
+            ".xls",
+        )
     ):
 
         raise HTTPException(
@@ -368,26 +1400,30 @@ async def upload_excel(
             detail=(
                 "Only Excel files "
                 "(.xlsx or .xls) are allowed."
-            )
+            ),
         )
 
-    # --------------------------------------------------
+    # --------------------------------------------------------
     # Read file
-    # --------------------------------------------------
+    # --------------------------------------------------------
 
-    file_content = await file.read()
+    content = await file.read()
 
-    if not file_content:
+    if not content:
 
         raise HTTPException(
             status_code=400,
-            detail="The uploaded file is empty."
+            detail="The Excel file is empty.",
         )
+
+    # --------------------------------------------------------
+    # Pandas
+    # --------------------------------------------------------
 
     try:
 
         dataframe = pd.read_excel(
-            BytesIO(file_content)
+            BytesIO(content)
         )
 
     except Exception as error:
@@ -395,113 +1431,199 @@ async def upload_excel(
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Unable to read Excel file: {str(error)}"
-            )
+                "Unable to read the Excel file: "
+                f"{str(error)}"
+            ),
         )
 
-    # --------------------------------------------------
+    # --------------------------------------------------------
     # Validate
-    # --------------------------------------------------
+    # --------------------------------------------------------
 
     validation = validate_dataframe(
         dataframe
     )
 
-    if validation["missing_columns"]:
+    # --------------------------------------------------------
+    # Missing columns
+    # --------------------------------------------------------
 
-        return {
-            "success": False,
-            "message": "Excel validation failed.",
-            "missing_columns": (
-                validation["missing_columns"]
-            ),
-            "available_columns": list(
-                dataframe.columns
-            ),
-        }
-
-    if validation["errors"]:
+    if validation[
+        "missing_columns"
+    ]:
 
         return {
             "success": False,
             "message": (
-                "Excel contains validation errors."
+                "Training calendar is missing "
+                "required columns."
             ),
-            "total_rows": len(
-                validation["dataframe"]
+            "file_type": (
+                "training_calendar"
             ),
-            "errors": validation["errors"],
+            "filename": file.filename,
+            "missing_columns": (
+                validation[
+                    "missing_columns"
+                ]
+            ),
+            "extra_columns": (
+                validation[
+                    "extra_columns"
+                ]
+            ),
+            "available_columns": (
+                validation[
+                    "available_columns"
+                ]
+            ),
+            "errors": [],
         }
 
-    dataframe = validation["dataframe"]
+    # --------------------------------------------------------
+    # Extra columns
+    # --------------------------------------------------------
 
-    # --------------------------------------------------
-    # Create preview
-    # --------------------------------------------------
+    if validation[
+        "extra_columns"
+    ]:
 
-    preview_dataframe = dataframe.head(10).copy()
+        return {
+            "success": False,
+            "message": (
+                "The uploaded file contains "
+                "columns that do not belong "
+                "to the training calendar."
+            ),
+            "file_type": (
+                "training_calendar"
+            ),
+            "filename": file.filename,
+            "missing_columns": [],
+            "extra_columns": (
+                validation[
+                    "extra_columns"
+                ]
+            ),
+            "available_columns": (
+                validation[
+                    "available_columns"
+                ]
+            ),
+            "errors": validation[
+                "errors"
+            ],
+        }
 
-    preview_dataframe["Training Date"] = (
-        pd.to_datetime(
-            preview_dataframe["Training Date"]
-        ).dt.strftime("%Y-%m-%d")
-    )
+    # --------------------------------------------------------
+    # Row validation errors
+    # --------------------------------------------------------
 
-    preview = (
-        preview_dataframe
-        .fillna("")
-        .to_dict(orient="records")
+    if validation[
+        "errors"
+    ]:
+
+        return {
+            "success": False,
+            "message": (
+                "Training calendar contains "
+                "validation errors."
+            ),
+            "file_type": (
+                "training_calendar"
+            ),
+            "filename": file.filename,
+            "total_rows": len(
+                validation[
+                    "dataframe"
+                ]
+            ),
+            "missing_columns": [],
+            "extra_columns": [],
+            "errors": validation[
+                "errors"
+            ],
+        }
+
+    # --------------------------------------------------------
+    # Preview
+    # --------------------------------------------------------
+
+    dataframe = validation[
+        "dataframe"
+    ]
+
+    preview = build_preview(
+        dataframe
     )
 
     return {
         "success": True,
         "message": (
-            "Excel file validated successfully."
+            "Training calendar validated "
+            "successfully."
+        ),
+        "file_type": (
+            "training_calendar"
         ),
         "filename": file.filename,
-        "total_rows": len(dataframe),
-        "preview_rows": len(preview),
+        "total_rows": len(
+            dataframe
+        ),
+        "preview_rows": len(
+            preview
+        ),
+        "columns": REQUIRED_COLUMNS,
         "preview": preview,
     }
 
 
-# ==================================================
-# 2. IMPORT EXCEL → POSTGRESQL
-# ==================================================
+# ============================================================
+# IMPORT TRAINING CALENDAR
+# ============================================================
 
 @router.post("/import")
 async def import_excel(
     file: UploadFile = File(...),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(
+        get_db
+    ),
 ):
     """
-    Validate Excel and import its data into PostgreSQL.
+    Import annual training calendar.
 
-    Creates/updates:
+    HOD and Line Manager details are NOT read
+    from this file.
 
-    - Departments
-    - HODs
-    - Line Managers
-    - Employees
-    - Trainings
-    - Training Assignments
+    Those are maintained through Settings /
+    Master Recipient Excel.
     """
 
-    # --------------------------------------------------
-    # Check file
-    # --------------------------------------------------
+    # --------------------------------------------------------
+    # Filename
+    # --------------------------------------------------------
 
     if not file.filename:
 
         raise HTTPException(
             status_code=400,
-            detail="No file was selected."
+            detail="No file was selected.",
         )
 
-    filename = file.filename.lower()
+    # --------------------------------------------------------
+    # Extension
+    # --------------------------------------------------------
+
+    filename = (
+        file.filename
+        .lower()
+    )
 
     if not filename.endswith(
-        (".xlsx", ".xls")
+        (
+            ".xlsx",
+            ".xls",
+        )
     ):
 
         raise HTTPException(
@@ -509,26 +1631,26 @@ async def import_excel(
             detail=(
                 "Only Excel files "
                 "(.xlsx or .xls) are allowed."
-            )
+            ),
         )
 
-    file_content = await file.read()
+    # --------------------------------------------------------
+    # Read file
+    # --------------------------------------------------------
 
-    if not file_content:
+    content = await file.read()
+
+    if not content:
 
         raise HTTPException(
             status_code=400,
-            detail="The uploaded file is empty."
+            detail="The Excel file is empty.",
         )
-
-    # --------------------------------------------------
-    # Read Excel
-    # --------------------------------------------------
 
     try:
 
         dataframe = pd.read_excel(
-            BytesIO(file_content)
+            BytesIO(content)
         )
 
     except Exception as error:
@@ -536,328 +1658,386 @@ async def import_excel(
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Unable to read Excel file: {str(error)}"
-            )
+                "Unable to read the Excel file: "
+                f"{str(error)}"
+            ),
         )
 
-    # --------------------------------------------------
-    # Validate Excel
-    # --------------------------------------------------
+    # --------------------------------------------------------
+    # Validate
+    # --------------------------------------------------------
 
     validation = validate_dataframe(
         dataframe
     )
 
-    if validation["missing_columns"]:
+    # --------------------------------------------------------
+    # Missing columns
+    # --------------------------------------------------------
 
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "message": "Excel validation failed.",
-                "missing_columns": (
-                    validation["missing_columns"]
-                ),
-            },
-        )
-
-    if validation["errors"]:
+    if validation[
+        "missing_columns"
+    ]:
 
         raise HTTPException(
             status_code=400,
             detail={
                 "message": (
-                    "Excel contains validation errors."
+                    "Training calendar is missing "
+                    "required columns."
                 ),
-                "errors": validation["errors"],
+                "missing_columns": (
+                    validation[
+                        "missing_columns"
+                    ]
+                ),
+                "extra_columns": (
+                    validation[
+                        "extra_columns"
+                    ]
+                ),
+                "available_columns": (
+                    validation[
+                        "available_columns"
+                    ]
+                ),
+                "errors": [],
             },
         )
 
-    dataframe = validation["dataframe"]
+    # --------------------------------------------------------
+    # Extra columns
+    # --------------------------------------------------------
 
-    # --------------------------------------------------
-    # Counters
-    # --------------------------------------------------
+    if validation[
+        "extra_columns"
+    ]:
+
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": (
+                    "The uploaded file contains "
+                    "unsupported extra columns."
+                ),
+                "missing_columns": [],
+                "extra_columns": (
+                    validation[
+                        "extra_columns"
+                    ]
+                ),
+                "available_columns": (
+                    validation[
+                        "available_columns"
+                    ]
+                ),
+                "errors": validation[
+                    "errors"
+                ],
+            },
+        )
+
+    # --------------------------------------------------------
+    # Validation errors
+    # --------------------------------------------------------
+
+    if validation[
+        "errors"
+    ]:
+
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": (
+                    "Training calendar contains "
+                    "validation errors."
+                ),
+                "errors": validation[
+                    "errors"
+                ],
+            },
+        )
+
+    dataframe = validation[
+        "dataframe"
+    ]
+
+    # ========================================================
+    # IMPORT COUNTERS
+    # ========================================================
 
     imported_rows = 0
-    created_departments = 0
-    created_hods = 0
-    created_managers = 0
-    created_employees = 0
+
     created_trainings = 0
-    created_assignments = 0
+    updated_trainings = 0
+
+    training_ids = []
+
+    audience_errors = []
+    audience_cache = {}
+
+    # ========================================================
+    # PRE-CHECK ALL TARGET AUDIENCES
+    # ========================================================
+    #
+    # Target Audience is the master relationship shared by:
+    #
+    #   Training.audience_id
+    #   HOD.audience_id
+    #   LineManager.audience_id
+    #
+    # HOD and Line Manager records are maintained through the
+    # Settings / Master Recipient Excel. Therefore the calendar
+    # import only resolves an existing Target Audience.
+    # ========================================================
+
+    for index, row in dataframe.iterrows():
+
+        target_audience = str(
+            clean_value(
+                row["Target Audience"]
+            )
+        ).strip()
+
+        cache_key = target_audience.lower()
+
+        if cache_key in audience_cache:
+            continue
+
+        audience = await resolve_target_audience(
+            db=db,
+            target_audience=target_audience,
+        )
+
+        if audience is None:
+            audience_errors.append(
+                {
+                    "row": index + 2,
+                    "target_audience": target_audience,
+                    "message": (
+                        f"Target Audience '{target_audience}' "
+                        "does not exist in the Target Audience "
+                        "master table. Upload it through Settings "
+                        "before importing the training calendar."
+                    ),
+                }
+            )
+        else:
+            audience_cache[cache_key] = audience
+
+    # --------------------------------------------------------
+    # Stop before database modification
+    # --------------------------------------------------------
+
+    if audience_errors:
+
+        return {
+            "success": False,
+            "message": (
+                "Import cannot continue because one or more "
+                "Target Audience values are not configured "
+                "in Settings."
+            ),
+            "target_audience_errors": audience_errors,
+            "hint": (
+                "Add the Target Audience and its HOD / Line "
+                "Manager recipients through the Settings "
+                "Master Recipient Excel, then retry the import."
+            ),
+        }
+
+    # ========================================================
+    # DATABASE IMPORT
+    # ========================================================
 
     try:
 
-        # ==================================================
-        # Process every Excel row
-        # ==================================================
-
         for index, row in dataframe.iterrows():
 
-            # --------------------------------------------------
-            # Read values
-            # --------------------------------------------------
+            # ------------------------------------------------
+            # Read Excel values
+            # ------------------------------------------------
 
-            employee_name = str(
-                row["Employee"]
-            ).strip()
-
-            employee_email = (
-                str(row["Employee Email"]).strip()
-                if pd.notna(
-                    row["Employee Email"]
+            serial_number = (
+                parse_serial_number(
+                    row["S.No"]
                 )
-                else None
             )
 
             training_name = str(
-                row["Training"]
+                clean_value(
+                    row[
+                        "Training Topic"
+                    ]
+                )
             ).strip()
 
-            training_date = pd.to_datetime(
-                row["Training Date"]
-            ).date()
-
-            department_name = str(
-                row["Department"]
+            training_type = str(
+                clean_value(
+                    row[
+                        "Training Type"
+                    ]
+                )
             ).strip()
 
-            hod_name = str(
-                row["HOD"]
+            target_audience = str(
+                clean_value(
+                    row[
+                        "Target Audience"
+                    ]
+                )
             ).strip()
 
-            hod_email = str(
-                row["HOD Email"]
+            trainer_name = str(
+                clean_value(
+                    row[
+                        "Trainer's Name"
+                    ]
+                )
             ).strip()
 
-            manager_name = str(
-                row["Line Manager"]
+            scheduled_date = (
+                parse_excel_date(
+                    row[
+                        "Training From Date"
+                    ]
+                )
+            )
+
+            scheduled_end_date = (
+                parse_excel_date(
+                    row[
+                        "Training To Date"
+                    ]
+                )
+            )
+
+            scheduled_time = (
+                parse_training_time(
+                    row[
+                        "Timing"
+                    ]
+                )
+            )
+
+            duration_hours = (
+                parse_duration(
+                    row[
+                        "Duration of the Training Hours"
+                    ]
+                )
+            )
+
+            venue = str(
+                clean_value(
+                    row[
+                        "Venue"
+                    ]
+                )
             ).strip()
 
-            manager_email = str(
-                row["Manager Email"]
-            ).strip()
+            # ------------------------------------------------
+            # Resolve Target Audience
+            # ------------------------------------------------
 
-            # ==================================================
-            # Department
-            # ==================================================
-
-            department_result = await db.execute(
-                select(Department).where(
-                    Department.name
-                    == department_name
-                )
+            audience = audience_cache.get(
+                target_audience.lower()
             )
 
-            department = (
-                department_result
-                .scalar_one_or_none()
-            )
+            if audience is None:
 
-            if not department:
-
-                department = Department(
-                    name=department_name
+                audience = await resolve_target_audience(
+                    db=db,
+                    target_audience=target_audience,
                 )
 
-                db.add(department)
+                if audience is None:
+                    raise ValueError(
+                        f"Row {index + 2}: Target Audience "
+                        f"'{target_audience}' does not exist "
+                        "in the Target Audience master table."
+                    )
 
-                await db.flush()
+                audience_cache[target_audience.lower()] = audience
 
-                created_departments += 1
+            # =================================================
+            # FIND EXISTING TRAINING
+            # =================================================
 
-            # ==================================================
-            # HOD
-            # ==================================================
-
-            hod_result = await db.execute(
-                select(HOD).where(
-                    HOD.email == hod_email,
-                    HOD.department_id
-                    == department.id,
-                )
-            )
-
-            hod = (
-                hod_result
-                .scalar_one_or_none()
-            )
-
-            if hod:
-
-                hod.name = hod_name
-
-            else:
-
-                hod = HOD(
-                    name=hod_name,
-                    email=hod_email,
-                    department_id=department.id,
-                )
-
-                db.add(hod)
-
-                await db.flush()
-
-                created_hods += 1
-
-            # ==================================================
-            # Line Manager
-            # ==================================================
-
-            manager_result = await db.execute(
-                select(LineManager).where(
-                    LineManager.email
-                    == manager_email,
-                    LineManager.department_id
-                    == department.id,
-                )
-            )
-
-            manager = (
-                manager_result
-                .scalar_one_or_none()
-            )
-
-            if manager:
-
-                manager.name = manager_name
-
-            else:
-
-                manager = LineManager(
-                    name=manager_name,
-                    email=manager_email,
-                    department_id=department.id,
-                )
-
-                db.add(manager)
-
-                await db.flush()
-
-                created_managers += 1
-
-            # ==================================================
-            # Employee
-            # ==================================================
-
-            employee_result = await db.execute(
-                select(Employee).where(
-                    Employee.name
-                    == employee_name,
-                    Employee.department_id
-                    == department.id,
-                )
-            )
-
-            employee = (
-                employee_result
-                .scalar_one_or_none()
-            )
-
-            if employee:
-
-                employee.email = employee_email
-                employee.hod_id = hod.id
-                employee.line_manager_id = manager.id
-
-            else:
-
-                # Temporary employee code because
-                # current Excel template has no
-                # employee code column.
-
-                employee_code = (
-                    f"EXCEL-{index + 2}"
-                )
-
-                employee = Employee(
-                    employee_code=employee_code,
-                    name=employee_name,
-                    email=employee_email,
-                    department_id=department.id,
-                    hod_id=hod.id,
-                    line_manager_id=manager.id,
-                )
-
-                db.add(employee)
-
-                await db.flush()
-
-                created_employees += 1
-
-            # ==================================================
-            # Training
-            # ==================================================
-
-            training_result = await db.execute(
+            result = await db.execute(
                 select(Training).where(
-                    Training.training_name
-                    == training_name,
-                    Training.department_id
-                    == department.id,
-                    Training.scheduled_date
-                    == training_date,
+                    Training.training_name == training_name,
+                    Training.audience_id == audience.id,
+                    Training.scheduled_date == scheduled_date,
                 )
             )
 
-            training = (
-                training_result
-                .scalar_one_or_none()
-            )
+            training = result.scalar_one_or_none()
 
-            if not training:
+            # =================================================
+            # CREATE TRAINING
+            # =================================================
+
+            if training is None:
+
+                now = datetime.utcnow()
 
                 training = Training(
                     training_name=training_name,
-                    department_id=department.id,
-                    scheduled_date=training_date,
+                    training_type=training_type,
+                    department_id=None,
+                    audience_id=audience.id,
+                    scheduled_date=scheduled_date,
+                    training_to_date=scheduled_end_date,
+                    scheduled_time=scheduled_time,
+                    duration_hours=duration_hours,
+                    venue=venue,
                     status="SCHEDULED",
+                    is_department_wise=False,
+                    attendance_required=True,
+                    ojt_required=False,
+                    trainer_name=trainer_name,
+                    created_at=now,
+                    updated_at=now,
                 )
 
                 db.add(training)
-
                 await db.flush()
-
                 created_trainings += 1
 
-            # ==================================================
-            # Training Assignment
-            # ==================================================
+            # =================================================
+            # UPDATE EXISTING TRAINING
+            # =================================================
 
-            assignment_result = await db.execute(
-                select(
-                    TrainingAssignment
-                ).where(
-                    TrainingAssignment.training_id
-                    == training.id,
-                    TrainingAssignment.employee_id
-                    == employee.id,
-                )
+            else:
+
+                training.training_type = training_type
+                training.audience_id = audience.id
+                training.scheduled_date = scheduled_date
+                training.training_to_date = scheduled_end_date
+                training.scheduled_time = scheduled_time
+                training.duration_hours = duration_hours
+                training.venue = venue
+                training.trainer_name = trainer_name
+                training.updated_at = datetime.utcnow()
+
+                updated_trainings += 1
+
+            # ------------------------------------------------
+            # Flush
+            # ------------------------------------------------
+
+            await db.flush()
+
+            training_ids.append(
+                training.id
             )
-
-            assignment = (
-                assignment_result
-                .scalar_one_or_none()
-            )
-
-            if not assignment:
-
-                assignment = TrainingAssignment(
-                    training_id=training.id,
-                    employee_id=employee.id,
-                    status="ASSIGNED",
-                )
-
-                db.add(assignment)
-
-                created_assignments += 1
 
             imported_rows += 1
 
-        # --------------------------------------------------
-        # Commit transaction
-        # --------------------------------------------------
+        # ====================================================
+        # COMMIT
+        # ====================================================
 
         await db.commit()
 
@@ -868,25 +2048,97 @@ async def import_excel(
         raise HTTPException(
             status_code=500,
             detail=(
-                f"Excel import failed: {str(error)}"
+                "Training calendar import failed: "
+                f"{str(error)}"
             ),
         )
 
-    # ==================================================
-    # Return result
-    # ==================================================
+    # ========================================================
+    # REMOVE DUPLICATE TRAINING IDS
+    # ========================================================
+
+    training_ids = list(
+        dict.fromkeys(
+            training_ids
+        )
+    )
+
+    # ========================================================
+    # GENERATE REMINDERS
+    # ========================================================
+
+    reminders_created = 0
+    reminder_errors = []
+    reminder_results = []
+
+    for training_id in training_ids:
+
+        result = (
+            await generate_reminders_for_training(
+                training_id
+            )
+        )
+
+        reminder_results.append(
+            result
+        )
+
+        reminders_created += int(
+            result.get(
+                "reminders_created",
+                0,
+            )
+        )
+
+        if not result.get(
+            "success",
+            False,
+        ):
+
+            reminder_errors.append(
+                {
+                    "training_id":
+                        training_id,
+
+                    "error":
+                        result.get(
+                            "error"
+                        ),
+                }
+            )
+
+    # ========================================================
+    # RESPONSE
+    # ========================================================
 
     return {
         "success": True,
+
         "message": (
-            "Excel data imported successfully."
+            "Training calendar imported "
+            "successfully."
         ),
+
         "filename": file.filename,
-        "imported_rows": imported_rows,
-        "created_departments": created_departments,
-        "created_hods": created_hods,
-        "created_line_managers": created_managers,
-        "created_employees": created_employees,
-        "created_trainings": created_trainings,
-        "created_assignments": created_assignments,
+
+        "file_type":
+            "training_calendar",
+
+        "imported_rows":
+            imported_rows,
+
+        "created_trainings":
+            created_trainings,
+
+        "updated_trainings":
+            updated_trainings,
+
+        "reminders_created":
+            reminders_created,
+
+        "reminder_errors":
+            reminder_errors,
+
+        "reminder_results":
+            reminder_results,
     }

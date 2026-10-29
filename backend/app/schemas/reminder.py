@@ -1,3 +1,4 @@
+
 from datetime import datetime, time
 from enum import Enum
 
@@ -108,17 +109,31 @@ class ReminderRecipientResponse(BaseModel):
     model_config = ConfigDict(
         from_attributes=True
     )
+
+
+# ============================================================
+# REMINDER RESPONSE
+# ============================================================
+
 class ReminderResponse(BaseModel):
     id: int
     training_id: int
+
+    # Supports automatic and manually created reminders
     reminder_type: str
     recipient_type: str
     recipient_id: int | None
     channel: str
+
+    # Manual reminder fields
+    title: str | None = None
+    custom_message: str | None = None
+
+    # Scheduling and delivery details
     scheduled_at: datetime
     status: str
-    sent_at: datetime | None
-    failure_reason: str | None
+    sent_at: datetime | None = None
+    failure_reason: str | None = None
 
     model_config = ConfigDict(
         from_attributes=True

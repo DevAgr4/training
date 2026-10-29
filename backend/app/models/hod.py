@@ -29,9 +29,36 @@ class HOD(Base):
         nullable=True
     )
 
-    department_id: Mapped[int] = mapped_column(
+    # --------------------------------------------------
+    # DEPARTMENT
+    # --------------------------------------------------
+    # Kept for legacy/reporting purposes.
+    # It is optional because recipients are now routed
+    # primarily through Target Audience.
+    # --------------------------------------------------
+
+    department_id: Mapped[int | None] = mapped_column(
         ForeignKey("departments.id"),
-        nullable=False,
+        nullable=True,
+        index=True
+    )
+
+    # --------------------------------------------------
+    # TARGET AUDIENCE
+    # --------------------------------------------------
+    # Connects the HOD to the shared target_audiences table.
+    #
+    # Example:
+    # Anita Rao -> All HODs and Line Managers
+    # audience_id = 1
+    # --------------------------------------------------
+
+    audience_id: Mapped[int | None] = mapped_column(
+        ForeignKey(
+            "target_audiences.id",
+            ondelete="SET NULL"
+        ),
+        nullable=True,
         index=True
     )
 

@@ -1,0 +1,5 @@
+ALTER TABLE reminders
+    ADD COLUMN IF NOT EXISTS title VARCHAR(255);
+
+ALTER TABLE reminders
+    ADD COLUMN IF NOT EXISTS custom_message TEXT;

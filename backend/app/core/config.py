@@ -19,6 +19,20 @@ class Settings(BaseSettings):
 
     REDIS_URL: str = "redis://localhost:6379/0"
 
+    # SMTP / Email Configuration
+    SMTP_HOST: str
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: str
+    SMTP_PASSWORD: str
+    SMTP_FROM_EMAIL: str
+    SMTP_USE_TLS: bool = True
+
+    # WhatsApp Cloud API Configuration
+    WHATSAPP_API_URL: str
+    WHATSAPP_PHONE_NUMBER_ID: str
+    WHATSAPP_BUSINESS_ACCOUNT_ID: str
+    WHATSAPP_ACCESS_TOKEN: str
+
     model_config = SettingsConfigDict(
         env_file=".env",
         extra="ignore",

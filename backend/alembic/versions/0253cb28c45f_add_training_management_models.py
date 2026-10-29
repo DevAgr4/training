@@ -1,3 +1,4 @@
+
 """add training management models
 
 Revision ID: 0253cb28c45f

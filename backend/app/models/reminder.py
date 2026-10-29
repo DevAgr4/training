@@ -1,3 +1,4 @@
+
 from datetime import datetime
 
 from sqlalchemy import DateTime, ForeignKey, String, Text
@@ -11,59 +12,77 @@ class Reminder(Base):
 
     id: Mapped[int] = mapped_column(
         primary_key=True,
-        index=True
+        index=True,
     )
 
     training_id: Mapped[int] = mapped_column(
         ForeignKey("trainings.id", ondelete="CASCADE"),
         nullable=False,
-        index=True
+        index=True,
     )
 
     reminder_type: Mapped[str] = mapped_column(
         String(50),
-        nullable=False
+        nullable=False,
+    )
+
+    # Manual reminder title; remains NULL for automatic reminders.
+    title: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+
+    # Custom email message for manually created reminders.
+    custom_message: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
     )
 
     recipient_type: Mapped[str] = mapped_column(
         String(50),
-        nullable=False
+        nullable=False,
     )
 
     recipient_id: Mapped[int | None] = mapped_column(
-        nullable=True
+        nullable=True,
     )
 
     channel: Mapped[str] = mapped_column(
         String(30),
-        nullable=False
+        nullable=False,
     )
 
     scheduled_at: Mapped[datetime] = mapped_column(
         DateTime,
         nullable=False,
-        index=True
+        index=True,
     )
 
     status: Mapped[str] = mapped_column(
         String(30),
         default="PENDING",
         nullable=False,
-        index=True
+        index=True,
     )
 
     sent_at: Mapped[datetime | None] = mapped_column(
         DateTime,
-        nullable=True
+        nullable=True,
     )
 
     failure_reason: Mapped[str | None] = mapped_column(
         Text,
-        nullable=True
+        nullable=True,
+    )
+
+    # Meta WhatsApp message ID.
+    whatsapp_message_id: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
     )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=datetime.utcnow,
-        nullable=False
+        nullable=False,
     )
